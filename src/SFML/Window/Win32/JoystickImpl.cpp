@@ -29,6 +29,7 @@
 #include <SFML/System/Clock.hpp>
 #include <SFML/System/Err.hpp>
 #include <windows.h>
+#include <process.h>
 #include <tchar.h>
 #include <regstr.h>
 #include <algorithm>
@@ -49,6 +50,9 @@
 #define DIDFT_OPTIONAL 0x80000000
 #endif
 
+#ifndef DI_CREATE_TIMEOUT
+#define DI_CREATE_TIMEOUT 2000
+#endif
 
 namespace
 {
@@ -70,6 +74,20 @@ namespace
 
     HMODULE dinput8dll = NULL;
     IDirectInput8W* directInput = NULL;
+
+    typedef HRESULT(WINAPI *DirectInput8CreateFunc)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
+    DirectInput8CreateFunc directInput8Create = nullptr;
+    volatile HRESULT diCreateResult = (HRESULT)-1;
+    bool freezeDuringDInputInitialization = false; // freeze in dinput8.dll (Windows 10 + DInput8 bug)
+
+    // Thread function for DirectInput8 creation
+    unsigned __stdcall initDiThreadFunction(void* arg)
+    {
+        // Try to acquire a DirectInput 8.x interface
+        diCreateResult = directInput8Create((HINSTANCE)arg, 0x0800, guids::IID_IDirectInput8W, reinterpret_cast<void**>(&directInput), NULL);
+        _endthreadex(0);
+        return 0;
+    }
 
     struct JoystickRecord
     {
@@ -238,6 +256,9 @@ bool JoystickImpl::isConnected(unsigned int index)
     if (directInput)
         return isConnectedDInput(index);
 
+    if (freezeDuringDInputInitialization)
+        return false;
+
     ConnectionCache& cache = connectionCache[index];
     if (!lazyUpdates && cache.timer.getElapsedTime() > connectionRefreshDelay)
     {
@@ -263,6 +284,9 @@ void JoystickImpl::updateConnections()
     if (directInput)
         return updateConnectionsDInput();
 
+    if (freezeDuringDInputInitialization)
+        return;
+
     for (unsigned int i = 0; i < Joystick::Count; ++i)
     {
         JOYINFOEX joyInfo;
@@ -280,6 +304,9 @@ bool JoystickImpl::open(unsigned int index)
 {
     if (directInput)
         return openDInput(index);
+
+    if (freezeDuringDInputInitialization)
+        return false;
 
     // No explicit "open" action is required
     m_index = JOYSTICKID1 + index;
@@ -403,22 +430,29 @@ void JoystickImpl::initializeDInput()
     if (dinput8dll)
     {
         // Try to get the address of the DirectInput8Create entry point
-        typedef HRESULT(WINAPI *DirectInput8CreateFunc)(HINSTANCE, DWORD, REFIID, LPVOID*, LPUNKNOWN);
-        DirectInput8CreateFunc directInput8Create = reinterpret_cast<DirectInput8CreateFunc>(GetProcAddress(dinput8dll, "DirectInput8Create"));
+        directInput8Create = reinterpret_cast<DirectInput8CreateFunc>(GetProcAddress(dinput8dll, "DirectInput8Create"));
 
         if (directInput8Create)
         {
-            // Try to acquire a DirectInput 8.x interface
-            HRESULT result = directInput8Create(GetModuleHandleW(NULL), 0x0800, guids::IID_IDirectInput8W, reinterpret_cast<void**>(&directInput), NULL);
+            diCreateResult = (HRESULT)-1;
 
-            if (FAILED(result))
+            unsigned threadID;
+            HANDLE hThread = (HANDLE)_beginthreadex(NULL, 0, &initDiThreadFunction, GetModuleHandleW(NULL), 0, &threadID);
+            if (WaitForSingleObject(hThread, DI_CREATE_TIMEOUT) == WAIT_TIMEOUT)
+            {
+                TerminateThread(hThread, (DWORD)-1);
+                err() << "DirectInput8Create timeout" << std::endl;
+                freezeDuringDInputInitialization = true;
+            }
+
+            if (FAILED(diCreateResult))
             {
                 // De-initialize everything
                 directInput = NULL;
                 FreeLibrary(dinput8dll);
                 dinput8dll = NULL;
 
-                err() << "Failed to initialize DirectInput: " << result << std::endl;
+                err() << "Failed to initialize DirectInput: " << diCreateResult << std::endl;
             }
         }
         else
